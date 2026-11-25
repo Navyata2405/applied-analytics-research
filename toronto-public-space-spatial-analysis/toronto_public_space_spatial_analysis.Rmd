@@ -1,0 +1,679 @@
+---
+title: "NEERAJ_Navyata_Final_Project"
+output: html_document
+date: "2024-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r library}
+
+library(tidyverse)
+library(leaflet) 
+library(sf) 
+library(units) 
+library(spdep)
+library(spData) 
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(leaflet.extras)
+library(pgirmess)
+library(spatialreg) # for SAR and CAR
+library(spgwr) # for GWR
+library(spaMM) # for mixed effects models
+library(dbscan)
+
+
+
+```
+
+```{r, directory}
+data.dir = gsub('/code', '/data', getwd())
+print(data.dir)
+```
+
+```{r import data}
+TO_PFR = st_read(paste0(data.dir,"/Project/Parks and Recreation Facilities - 4326.shp"))
+TO_Neigh_Stats = st_read(paste0(data.dir,"/Project/neighbourhood-stats-1.csv"))
+TO_Neigh = st_read(paste0(data.dir,"/Project/Toronto_Neighbourhoods.shp"))
+
+```
+
+```{r}
+
+#leaflet plot on neighbourhoods, and colour by income 
+
+#merge by neighbour
+
+merged_TO_Neigh <- TO_Neigh %>%
+left_join(TO_Neigh_Stats, by = "Neighbourh")
+
+
+merged_TO_Neigh$median_family_income <- as.numeric(merged_TO_Neigh$median_family_income)
+
+summary(merged_TO_Neigh$median_family_income)
+
+```
+
+Here first we merge the dataset by neighbourhoods, specifically the addresses of the public spaces with the neighbourhoods using spatial join. By doing this we are combining spatial data with socioeconomic data allowing us to analyze the relationship between neighbourhood income levels and the spatial distribution of public spaces later on. 
+
+```{r}
+TO_PFR = TO_PFR %>% 
+st_as_sf(coords=c('lon','lat'), crs=4326, remove=FALSE) %>% #set datum
+mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2]) # extract x, y in km
+
+TO_PFR_Data <- TO_PFR %>% st_drop_geometry()
+class(TO_PFR_Data)
+
+summary(TO_PFR_Data)
+
+
+```
+
+Moving on here we are converting the PFR dataset into spatial object. This is necessary because you want to map the locations of public spaces and analyze their distribution across Toronto. 
+
+
+```{r}
+quantiles <- quantile(merged_TO_Neigh$median_family_income, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
+
+legend_labels <- paste(
+"$", format(quantiles[-length(quantiles)], big.mark = ","), 
+" - $", format(quantiles[-1], big.mark = ",")
+)
+
+# Create leaflet map with custom legend
+merged_TO_Neigh %>% 
+leaflet() %>% 
+addProviderTiles('CartoDB.Positron') %>% 
+addPolygons(
+fillColor = ~colorBin("Greens", merged_TO_Neigh$median_family_income, bins = quantiles, na.color = "transparent")(median_family_income),
+weight = 1,
+opacity = 1,
+color = "grey",
+dashArray = "1",
+fillOpacity = 0.7,
+highlightOptions = highlightOptions(
+weight = 5,
+color = "black",
+dashArray = "",
+fillOpacity = 0.7,
+bringToFront = FALSE
+),
+label = ~paste("Neighbourhood: ", Neighbourh)
+) %>%
+# Add circle markers
+addCircleMarkers(
+lng = ~TO_PFR_Data$x, lat = ~TO_PFR_Data$y, color = "black", popup = "Public Spaces", radius = 0.1, opacity = 1) %>%
+addLegend("bottomright", 
+pal = colorBin("Greens", merged_TO_Neigh$median_family_income, bins = quantiles), 
+values = merged_TO_Neigh$median_family_income, 
+title = "Median Family Income",
+opacity = 1,
+labels = legend_labels,# Updated labels
+labFormat = labelFormat(prefix = "$")
+)
+
+
+
+
+quantiles <- quantile(merged_TO_Neigh$median_family_income, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
+
+legend_labels <- paste(
+"$", format(quantiles[-length(quantiles)], big.mark = ","), 
+" - $", format(quantiles[-1], big.mark = ",")
+)
+
+# Create leaflet map with custom legend
+merged_TO_Neigh %>% 
+leaflet() %>% 
+addProviderTiles('CartoDB.Positron') %>% 
+addPolygons(
+fillColor = ~colorBin("Greens", merged_TO_Neigh$median_family_income, bins = quantiles, na.color = "transparent")(median_family_income),
+weight = 1,
+opacity = 1,
+color = "grey",
+dashArray = "1",
+fillOpacity = 0.7,
+highlightOptions = highlightOptions(
+weight = 5,
+color = "black",
+dashArray = "",
+fillOpacity = 0.7,
+bringToFront = FALSE
+),
+label = ~paste("Neighbourhood: ", Neighbourh)
+) %>%
+addLegend("bottomright", 
+pal = colorBin("Greens", merged_TO_Neigh$median_family_income, bins = quantiles), 
+values = merged_TO_Neigh$median_family_income, 
+title = "Median Family Income",
+opacity = 1,
+labels = legend_labels,# Updated labels
+labFormat = labelFormat(prefix = "$")
+)
+
+```
+
+Bottom 20% as low income and then map that out in a similar way 
+
+Next, here we are visualising income distribution to get a sense of the distibution. This allows you to see whether low-income neighborhoods are spatially clustered or if they are scattered across the city.
+
+By overlaying public spaces on the income map, we can start to explore whether low-income neighborhoods have equitable access to public spaces. here we can see that 1. there are many parks in toronto, 2. most are concentrated in the southern part, but there is fairly, high concentration in centre as well. There are some gaps in the north east and west, which are on the lower end of the income spectrum. To get a better idea, we can try to look at the exactly how many public spaces are in each neighbourhood.
+
+
+```{r}
+#Spatial join for neighbourhood and the PFR points 
+
+TO_Neigh_PFR = st_join(merged_TO_Neigh, TO_PFR, join=st_intersects, left = FALSE) %>%
+group_by(Neighbourh) 
+
+# Create a new dataset with count of public spaces per neighbourhood
+public_spaces_count <- TO_Neigh_PFR %>%
+group_by(Neighbourh) %>%
+mutate(count = n()) %>% # Count the number of public spaces in each neighbourhood
+
+# View the dataset with the new count column
+print(public_spaces_count)
+
+```
+Now by combining the income data with the number of public spaces per neighborhood will help in analyzing whether neighborhoods with lower median incomes have fewer public spaces compared to wealthier neighborhoods. This spatial join creates a new dataset (public_spaces_count) that enables us to explore equity in the distribution of public spaces.
+
+
+```{r do we need this? maybe some summary stats}
+public_spaces_count %>%
+  group_by(Neighbourh) %>%
+  summarize(average_count = mean(count)) %>%
+  arrange(desc(average_count))
+```
+
+
+```{r}
+
+#Map the public spaces per neighbourhood
+
+quantiles2 <- quantile(public_spaces_count$count, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
+
+legend_labels <- paste(
+"$", format(quantiles2[-length(quantiles2)], big.mark = ","), 
+" - $", format(quantiles2[-1], big.mark = ",")
+)
+
+# Create leaflet map with custom legend
+merged_TO_Neigh %>% 
+leaflet() %>% 
+addProviderTiles('CartoDB.Positron') %>% 
+addPolygons(
+fillColor = ~colorBin("Greens", public_spaces_count$count, bins = quantiles2, na.color = "transparent")(public_spaces_count$count),
+weight = 1,
+opacity = 1,
+color = "grey",
+dashArray = "1",
+fillOpacity = 0.7,
+highlightOptions = highlightOptions(
+weight = 5,
+color = "black",
+dashArray = "",
+fillOpacity = 0.7,
+bringToFront = FALSE
+)) %%
+addLegend("bottomright", pal = colorBin("Greens", public_spaces_count$count, bins = quantiles2), values = public_spaces_count$count, title = "Public Spaces per neighbourhood")
+
+
+legend_labels <- paste(
+"$", format(quantiles[-length(quantiles)], big.mark = ","), 
+" - $", format(quantiles[-1], big.mark = ",")
+)
+public.pal2 = colorNumeric(c('lightblue','blue','darkblue'), 
+domain=public_spaces_count$median_family_income)
+public_spaces_count %>% 
+leaflet() %>% 
+addProviderTiles('CartoDB.Positron') %>% 
+addPolygons(weight=0, fillOpacity=.8, color=~public.pal2(median_family_income),
+label=~paste0(Neighbourh, ": ", median_family_income)) %>%
+addLegend('bottomleft', pal=public.pal2, values=public_spaces_count$median_family_income, opacity=.8, title="Income level per neighbourhood")
+
+```
+
+a leaflet map that visualizes the number of public spaces per neighborhood in Toronto, with different colors representing the count of public spaces in each neighborhood. Here we see that in particular 3 neihbourhoods stand out, waterfront, south riverdale and rouge. Other than than that, some clusters are seen in the centre north and west. By comparing this map with the map of income levels (from earlier), we can start to investigate whether low-income neighborhoods are underrepresented in terms of public spaces. 
+
+Comparing it to the income map, we don't see much ccorrelation that high income areas have the most green spaces. However, with low public space count neighbourhoods, are predominently in the low income neighbourhoods. 
+
+```{r}
+#Number of parks per capita 
+
+# Create a new dataset with count of public spaces per neighbourhood
+public_spaces_count_per_thou <- public_spaces_count %>%
+group_by(Neighbourh) %>%
+mutate(count = n()) %>% # Count the number of public spaces in each neighbourhood
+mutate(per_thousand = 1000*(count /Total_Popu)) %>% # Calculate public spaces per capita
+
+# View the dataset with the new count column
+print(public_spaces_count_per_thou)
+
+public.pal = colorNumeric(c('beige','lightgreen','forestgreen','darkgreen'), 
+domain=public_spaces_count_per_thou$per_thousand)
+public_spaces_count_per_thou %>% 
+leaflet() %>% 
+addProviderTiles('CartoDB.Positron') %>% 
+addPolygons(weight=0, fillOpacity=.8, color=~public.pal(per_thousand),
+label=~paste0(Neighbourh, ": ", per_thousand)) %>%
+addLegend('bottomleft', pal=public.pal, values=public_spaces_count_per_thou$per_thousand, opacity=.8, title="Public Spaces per thousand people")
+
+
+
+
+#Make a table 
+```
+To get a better estimate of the distribution of public spaces, I plotted the public space per capita using the population metric in the dataset. By calculating the number of public spaces per 1,000 people, I am normalizing the public space count to account for neighborhood population size. This allows for a fair comparison of public space availability across neighborhoods of different sizes.A neighborhood with fewer people might still have a high number of public spaces per capita, whereas a densely populated neighborhood might have more people competing for a limited number of spaces.
+
+So here, we see a very differnt map to the one above. We see the high public space count has shifted to neighbourhoods like bridle path, casa loma, rosedale, foreshil etc. which are known high income neighbourhoods of toronto. this support the hypothesis that equitable access to public spaces is a concern in Toronto.
+
+However, we will further run more statistical tests looking at the density of these public spaces. 
+
+
+
+```{r}
+
+TO_Neigh_PFR %>% 
+leaflet() %>% 
+addProviderTiles('CartoDB.Positron') %>% 
+setView(-79.3832,43.6532, zoom = 11) %>% 
+addCircles(~TO_Neigh_PFR$xTO_Neigh_PFR$y, label=TO_Neigh_PFR$TYPE,
+weight = 1, radius=20)
+
+```
+
+
+```{r}
+TO_Neigh_PFR_Counts <- TO_Neigh_PFR %>%
+group_by(Neighbourh) %>%# Group by neighborhood
+mutate(park_count = n()) %>%# Count number of parks in each neighborhood
+mutate(parks_per_child = park_count/Child0_14)%>% #Number of parks per child
+select(Neighbourh, Total_Area, Total_Popu, Child0_14, median_family_income, unemploy_rate, park_count, parks_per_child) %>%
+distinct()
+
+# Step 3: View the result
+print(TO_Neigh_PFR_Counts)
+
+
+```
+
+```{r - Moran's test for clustering}
+#Contiguity-based - Queen
+TO_nb_queen<-poly2nb(TO_Neigh_PFR_Counts, queen=TRUE)
+
+#weight matrix - Queen
+TO_queen_w <- nb2listw(TO_nb_queen, style="W")
+
+moran_park_count_queen<-moran.test(TO_Neigh_PFR_Counts$park_count,TO_queen_w, randomisation = FALSE)
+moran_park_count_queen
+
+correlogram_queen <- sp.correlogram(TO_nb_queen, TO_Neigh_PFR_Counts$park_count, order = 10, method = "I", zero.policy = TRUE)
+plot(correlogram_queen, main = "Spatial Correlogram - Queen Contiguity")
+```
+
+Here I perform a Moran's I test for spatial autocorrelation and generate a spatial correlogram to explore whether there is any clustering of public spaces (parks) within neighborhoods in Toronto, based on the Queen contiguity definition.
+
+The positive value of Moran’s I (0.0737) suggests that the distribution of parks in Toronto's neighborhoods is not random; rather, parks tend to cluster in neighborhoods with similar park counts.
+
+Interpretation: This means that neighborhoods with a higher number of parks are located near other neighborhoods with similarly high numbers of parks, and neighborhoods with fewer parks are near other areas with similarly fewer parks. This indicates clustering of public spaces in certain areas of the city.
+Statistical Significance: The p-value of 0.0488 is less than 0.05, meaning the clustering is statistically significant. This suggests that the clustering of parks is unlikely to be due to chance and is a real spatial pattern.
+
+Implications for Equity in Public Spaces:
+
+If high-income neighborhoods tend to have more parks and low-income neighborhoods have fewer parks, this result would support the hypothesis that access to public spaces in Toronto is unequal and geographically clustered.
+The clustering could indicate a spatial disparity in the distribution of parks, which is a crucial insight when discussing whether low-income neighborhoods have equitable access to public spaces.
+
+However, Moran's I of 0.0731 suggests a very weak positive spatial autocorrelation. This means that the park counts are slightly clustered, but not very strongly.
+
+```{r}
+
+
+TO_Neigh_PFR_Counts$unemploy_rate <- as.numeric(as.factor(TO_Neigh_PFR_Counts$unemploy_rate))
+#str(TO_Neigh_PFR_Counts)
+
+model_lm<-lm(scale(park_count) ~ scale(Total_Area) + scale(Total_Popu) + scale(Child0_14) + scale(unemploy_rate) + scale(median_family_income) + scale(parks_per_child), data=TO_Neigh_PFR_Counts)
+
+summary(model_lm)
+```
+
+Now, we will run a linear reg. model to understamd the factors influencing the number of parks in each neighborhood, using various socio-economic and demographic variables as predictors.
+
+Positive Relationships:
+
+Neighborhood area (Total_Area), population size (Total_Popu), and children (0-14) are positively related to the number of parks. Larger neighborhoods, those with higher populations, and neighborhoods with more children tend to have more parks.
+Parks per child: As expected, the more parks available per child in a neighborhood, the more parks that neighborhood has.
+Negative Relationships:
+
+Unemployment rate has a marginally significant negative relationship with the number of parks. Higher unemployment might be related to lower investment in parks and public spaces due to economic constraints.
+No Significant Relationship:
+
+Median family income does not have a significant impact on the number of parks in neighborhoods, at least in this linear model. This suggests that factors like neighborhood size, population, and the presence of children may play a more direct role in determining park availability.
+
+
+Summary: Variables such as scale(Total_Area), scale(Total_Popu), and scale(Child0_14) are significant at the 5% level (p-values < 0.05), suggesting they have a meaningful relationship with the park count.
+
+scale(unemploy_rate), scale(median_family_income), and scale(parks_per_child) do not have strong evidence to suggest a relationship with park count, given their higher p-values.
+
+R-squared:
+The model explains about 43.2% of the variance in the park count, which is a moderate fit.
+
+
+
+```{r}
+TO_Neigh_PFR_Counts$lm_resid<-residuals(model_lm)
+
+moran.test(TO_Neigh_PFR_Counts$lm_resid, listw=TO_queen_w)
+ggplot(TO_Neigh_PFR_Counts) + geom_sf(aes(fill = lm_resid))
+
+```
+Moran I statistic:
+
+0.0903 – This is a positive value, suggesting that there is some degree of positive spatial autocorrelation in the residuals. In other words, the residuals (the differences between the observed and predicted values) tend to be similar in nearby neighborhoods. This indicates that the model might have missed some spatial structure in explaining the distribution of parks.
+Expectation:
+
+-0.0072 – This is the expected value of Moran’s I under the null hypothesis (i.e., no spatial autocorrelation). The fact that the observed Moran's I (0.0903) is much larger than the expectation suggests that the residuals are not randomly distributed, but instead show some clustering.
+Variance:
+
+0.00235 – This gives us an idea of the variability of the Moran’s I statistic under the null hypothesis.
+p-value:
+
+0.02212 – The p-value is 0.02212, which is less than 0.05. This indicates that the result is statistically significant. Therefore, we reject the null hypothesis of no spatial autocorrelation in the residuals. This means that the residuals are spatially correlated, and the model has not fully accounted for spatial patterns in the data
+
+The positive Moran's I statistic (0.0903) and the significant p-value (0.02212) suggest that there is spatial clustering of residuals. In other words, the residuals (the unexplained variation in park counts) are not randomly distributed, but tend to cluster in certain areas. This spatial dependency in the residuals indicates that the model is missing some spatial structure, and there may be unaccounted factors that cause park distribution to be spatially related.
+
+
+```{r}
+model_sar_error <- spautolm(scale(park_count) ~ scale(Total_Area) + scale(Total_Popu) + scale(Child0_14) + scale(unemploy_rate) + scale(median_family_income) + scale(parks_per_child), data=TO_Neigh_PFR_Counts, listw = TO_queen_w)
+
+summary(model_sar_error)
+```
+Key Takeaways:
+Spatial Dependence: The SAR model indicates that there is some spatial dependence in the park counts. Although the evidence for spatial dependence is borderline (p-value = 0.056), the positive lambda value suggests a spatially clustered pattern in park distribution.
+
+Significant Predictors:
+
+Variables like Total Area, Total Population, Child Population, and Parks per Child are highly significant in explaining park counts.
+Unemployment rate and Median family income do not have significant effects in the model.
+Model Fit: The model seems to explain a substantial portion of the variation in park counts (R-squared = 0.86), with a relatively low residual variance, suggesting that it fits the data well.
+
+
+Key Takeaways:
+Significant predictors: Your model shows that larger areas, higher populations, and higher child populations are associated with more parks. The parks per child ratio is also highly significant, suggesting that neighborhoods with more children tend to have more parks.
+
+Spatial autocorrelation: The Lambda value suggests that there is still some spatial autocorrelation in the model’s residuals, though it is only marginally significant. This means that your model has better accounted for spatial structure compared to the previous linear model, but there could still be slight spatial dependencies in the errors.
+
+Unemployment and income: The unemployment rate and median family income were not significant in the model, suggesting that these variables may not have a direct impact on park availability in Toronto neighborhoods. This might be counterintuitive, but it could imply that park availability is driven more by population density, area, and child populations rather than economic factors like income or unemployment.
+
+Improved model: The spatial error model (spautolm) has likely improved the fit of the model compared to the standard linear regression by accounting for spatial dependencies, as evidenced by the Lambda parameter.
+
+```{r}
+TO_Neigh_PFR_Counts$sar_error_resid<-residuals(model_sar_error)
+
+moran.test(TO_Neigh_PFR_Counts$sar_error_resid, listw=TO_queen_w)
+
+ggplot(TO_Neigh_PFR_Counts) + geom_sf(aes(fill = sar_error_resid))
+```
+The negative Moran's I statistic close to zero and the high p-value (0.4601) suggest that there is no significant spatial autocorrelation in the residuals after accounting for spatial dependencies through the SAR error model.
+
+The result implies that the SAR error model has successfully removed the spatial autocorrelation in the residuals. This is an important outcome because it indicates that the spatial relationships between neighborhoods are now appropriately accounted for in the model.
+
+No spatial autocorrelation in residuals: Since the residuals no longer show any significant spatial structure, this suggests that your SAR error model has done a good job of modeling the spatial dependencies in the data, and further improvements may not be needed for this aspect.
+
+In summary:
+
+The SAR model seems appropriate for your data, as the residuals show no significant spatial autocorrelation.
+The Moran's I result for the residuals confirms that spatial dependence has been effectively modeled, and the assumption of spatial independence in the residuals holds.
+
+```{r - PPM Models & Density}
+
+public_spaces_window <- convexhull.xy(x = public_spaces_count_per_thou$x, y = public_spaces_count_per_thou$y)
+
+
+public_spaces_ppp <- ppp(x = public_spaces_count_per_thou$x, y = public_spaces_count_per_thou$y, window = public_spaces_window)
+
+
+
+p1 <- plot.ppp(public_spaces_ppp, main = "Public Spaces as ppp object", pch=16)
+```
+
+The plot will show the distribution of public spaces within the convex hull (the study area). You will see the locations of these spaces (represented as points) spread across the area of Toronto you are analyzing. The pattern of these points (whether they are clustered, dispersed, or random) will provide insight into how public spaces are distributed across the neighborhoods in Toronto.
+
+Here we see some clustering in downtown toronto and some towards the north. Other than that, the points are very evenly spread out. 
+
+
+
+
+
+You can also calculate density per area of neighborhood and use this as a predictor of income or vice versa in a SAR/CAR areal model
+
+
+```{r public space density}
+optim_bw<-bw.diggle(public_spaces_ppp, edge="border")
+
+ds <- density.ppp(public_spaces_ppp, sigma=optim_bw)
+plot(ds, main = "Public Spaces density")
+plot(public_spaces_ppp, add = TRUE, cols = "white", cex = 0.1, pch = 16)
+```
+
+The plot will show the estimated density of public spaces across Toronto, using a color gradient to represent higher and lower density areas. Here we see clustering in downstown toronto, and north of toronto. Some clustering long the east end and further on west end noth. 
+
+```{r}
+plot(dirichlet(public_spaces_ppp), main="Dirichlet Tesselation of Public Spaces")
+```
+
+slight clustering, evenly spread out
+
+```{r }
+
+#Part A with no covariates
+public_spaces_ppm_model_a = ppm(public_spaces_ppp ~1)
+summary(public_spaces_ppm_model_a)
+plot(public_spaces_ppm_model_a)
+
+
+#Part B with linear covariates
+public_spaces_ppm_model_b = ppm(public_spaces_ppp ~x + y)
+summary(public_spaces_ppm_model_b)
+plot(public_spaces_ppm_model_b)
+
+
+```
+In this section, you're using Point Process Models (PPM) from the spatstat package to model the distribution of public spaces in Toronto. Specifically, fitting two models:
+
+Part A: A homogeneous Poisson point process model, with no covariates.
+Part B: A linear point process model, where the intensity is allowed to vary with spatial location 
+
+
+
+```{r}
+public_spaces_count_per_thou <- public_spaces_count_per_thou %>%
+mutate(parks_per_child = count/Child0_14)
+
+public_spaces_count_per_thou
+```
+
+
+```{r}
+#Part C with a covariate representing the median_income, total_population, and child_population (between 0-14 years of age).
+
+# Create a cov
+median_income_im <- as.im(function(x, y) {
+public_spaces_count_per_thou$median_family_income #Family income
+}, W = public_spaces_window) 
+
+total_population_im <- as.im(function(x, y) {
+public_spaces_count_per_thou$Total_Popu #Total Population
+}, W = public_spaces_window) 
+
+child_population_im <- as.im(function(x, y) {
+public_spaces_count_per_thou$Child0_14 #Number of children
+}, W = public_spaces_window)
+
+total_area_im <- as.im(function(x, y) {
+public_spaces_count_per_thou$Total_Area #Total_area
+}, W = public_spaces_window)
+
+parks_per_child_im <- as.im(function(x, y) {
+public_spaces_count_per_thou$parks_per_child #Parks_per_child
+}, W = public_spaces_window)
+
+#Create the models with Distance to incinerator as a covariate
+public_spaces_ppm_model_c = ppm(public_spaces_ppp ~median_income_im + total_population_im + total_area_im) #Broader neighbourhood information
+summary(public_spaces_ppm_model_c)
+plot(public_spaces_ppm_model_c, lwd = 4)
+
+public_spaces_ppm_model_d = ppm(public_spaces_ppp ~ child_population_im + parks_per_child_im) #more specific information
+summary(public_spaces_ppm_model_d)
+plot(public_spaces_ppm_model_d, lwd = 4)
+```
+
+Child Population has a small positive effect, suggesting that areas with more children have a slightly higher intensity of public spaces, though the effect is small.
+
+
+Parks per Child has a strong positive effect, indicating that areas with more parks available to children have significantly higher densities of public spaces. This makes intuitive sense, as areas designed with more parks for children likely have a higher availability of public spaces in general.
+
+
+
+```{r}
+poisson_model <- glm(count ~ median_family_income + Total_Popu + Child0_14 +parks_per_child + Total_Area, 
+family = "poisson", data = public_spaces_count_per_thou)
+
+# Summarize the Poisson model
+summary(poisson_model)
+```
+
+```{r}
+public_spaces_ppp_pts<-as.points(public_spaces_ppp$x,public_spaces_ppp$y)
+
+#cluster 2
+db.clust1 = dbscan(public_spaces_ppp_pts, minPts = 3, eps=0.0075)
+hullplot(public_spaces_ppp_pts,db.clust1)
+
+
+# DBSCAN results table
+print(table(db.clust1$cluster))
+
+```
+
+
+INCOME ONLY 
+
+```{r}
+
+public_spaces_ppm_model_e = ppm(public_spaces_ppp ~median_income_im) #Broader neighbourhood information
+summary(public_spaces_ppm_model_e)
+plot(public_spaces_ppm_model_e, lwd = 4)
+
+```
+
+
+
+
+```{r}
+poisson_model <- glm(count ~ median_family_income, 
+                     family = "poisson", data = public_spaces_count_per_thou)
+
+# Summarize the Poisson model
+summary(poisson_model)
+```
+
+
+```{r}
+# Ripley's K test for Parks, transformed to L for better visualization
+K_parks<-Kest(public_spaces_ppp, correction="border")
+K_env_parks<-envelope(public_spaces_ppp, fun=Kest, nsim=99, correction = "border", savefuns = TRUE, verbose = FALSE)
+K_env_trans_parks <- K_env_parks
+K_env_trans_parks$obs <- sqrt(K_env_parks$obs / pi) - K_env_parks$r
+K_env_trans_parks$theo <- sqrt(K_env_parks$theo / pi) - K_env_parks$r
+K_env_trans_parks$lo <- sqrt(K_env_parks$lo / pi) - K_env_parks$r
+K_env_trans_parks$hi <- sqrt(K_env_parks$hi / pi) - K_env_parks$r
+plot(K_env_trans_parks, . ~ r, main = "Transformed L-Function with Envelopes (CSR)", legend = FALSE)
+
+#G Function for Lungs
+G_obs_parks <- Gest(public_spaces_ppp, correction = "rs")  
+G_env_parks <- envelope(public_spaces_ppp, fun = Gest, nsim = 99, correction = "rs", savefuns = TRUE, verbose = FALSE)
+plot(G_env_parks, . ~ r, main = "G-Function with Envelopes for Parks (CSR)", legend = FALSE)
+```
+
+g
+The G-function is another spatial statistic used to examine the distribution of points, but it focuses on the nearest neighbor distance. It provides a measure of how far apart points are from their nearest neighbors in the dataset
+
+If the observed G-function is above the envelope, it suggests that parks tend to be clustered at smaller distances.
+
+If the observed G-function falls within the envelope, this suggests no significant pattern or a random distribution of parks.
+
+
+
+```{r Quadrat testing}
+
+parks_ppp_pts<-as.points(public_spaces_ppp$x,public_spaces_ppp$y)
+
+
+#Quadratciunt
+Q_parks <- quadratcount(public_spaces_ppp, nx = 30, ny = 30)
+
+plot(parks_ppp_pts, cex = 0.5, pch="+", main="Parks in Quadrats", xlab="X",ylab="Y")
+plot(Q_parks, add = TRUE, cex = .5)
+
+#Quadrat Testing
+qt_parks_uniform <- quadrat.test(Q_parks, alternative="two.sided", method="M")
+qt_parks_uniform
+qt_parks_regular <- quadrat.test(Q_parks, alternative="regular", method="M")
+qt_parks_regular
+qt_parks_clustered <- quadrat.test(Q_parks, alternative="clustered", method="M")
+qt_parks_clustered
+
+
+#Summary Tables:
+quadrat_summary_table <- data.frame(
+  Test_Type = character(),
+  Test_Statistic = numeric(),
+  P_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+quadrat_summary_table <- rbind(quadrat_summary_table, data.frame(
+  Test_Type = "Uniform",
+  Test_Statistic = qt_parks_uniform$statistic,
+  P_value = qt_parks_uniform$p.value,
+  stringsAsFactors = FALSE
+))
+
+quadrat_summary_table <- rbind(quadrat_summary_table, data.frame(
+  Test_Type = "Clustered",
+  Test_Statistic = qt_parks_clustered$statistic,
+  P_value = qt_parks_clustered$p.value,
+  stringsAsFactors = FALSE
+))
+quadrat_summary_table <- rbind(quadrat_summary_table, data.frame(
+  Test_Type = "Regular",
+  Test_Statistic = qt_parks_regular$statistic,
+  P_value = qt_parks_regular$p.value,
+  stringsAsFactors = FALSE
+))
+
+print(quadrat_summary_table)
+
+```
+
+
+
+```{r}
+#Log Gaussian
+
+lgcp_mod1<-kppm(public_spaces_ppp, clusters="LGCP",method="mincon")
+summary(lgcp_mod1)
+plot(lgcp_mod1)
+plot(envelope(lgcp_mod1, Gest, nsim = 39, global = TRUE))
+
+```
